@@ -29,16 +29,26 @@ export type CompatTimeoutHandle = ReturnType<typeof setTimeout> | number;
 export type CompatIntervalHandle = ReturnType<typeof setInterval> | number;
 
 /**
- * A wrapper around the global fetch function to ensure compatibility across different environments.
- * In Obsidian, they recommend using their own requestUrl for better performance and reliability.
- * However, at least for now, requestUrl cannot handle multiple concurrent requests, which causes
- * problems for synchronise lively. So we will use the global fetch for now.
- * If the situation changes in the future, change this function to use requestUrl.
- * @param {RequestInfo} input  The resource that you wish to fetch. Can be either a string or a Request object.
- * @param {RequestInit} [init] An options object containing any custom settings that you want to apply to the request.
- * @returns {Promise<Response>} A Promise that resolves to the Response to that request, whether it is successful or not.
+ * The default transport is the host's global fetch implementation. Obsidian
+ * mobile runs inside Android WebView, where otherwise valid CouchDB requests
+ * can fail at the WebView fetch/CORS layer even though Obsidian's native
+ * requestUrl transport succeeds. Hosts may therefore replace this transport
+ * while keeping the common library independent of any host-specific API.
  */
-export const _fetch = compatGlobal.fetch.bind(compatGlobal);
+export type FetchFunction = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+const defaultFetch: FetchFunction = compatGlobal.fetch.bind(compatGlobal);
+let activeFetch: FetchFunction = defaultFetch;
+
+export const _fetch: FetchFunction = (input, init) => activeFetch(input, init);
+
+export function setFetch(func: FetchFunction) {
+    activeFetch = func;
+}
+
+export function resetFetch() {
+    activeFetch = defaultFetch;
+}
 
 type ActiveDocumentWindow = typeof window & { activeDocument?: Document };
 const activeDocumentWindow = compatGlobal as ActiveDocumentWindow;
