@@ -17,42 +17,10 @@ interface AnyDecryptedDoc {
 
 type DBSequence = number | string;
 
-// This bounds one HTTP response without changing the smaller PouchDB write
-// batches. Each completed page returns an opaque `last_seq` marker, which is
-// the only page boundary Fast Fetch needs to persist and replay.
-const FAST_FETCH_CHANGES_PAGE_LIMIT = 10_000;
+const FAST_FETCH_CHANGES_PAGE_LIMIT = 500;
 
-// A heartbeat keeps a continuous feed open after its finite limit on CouchDB
-// 3.2. Without a heartbeat, this timeout closes the feed after CouchDB has
-// exhausted the currently available changes and lets it emit `last_seq`.
-// Fast Fetch then reconnects from that cursor, so the short wait does not bound
-// the duration of an active page transfer.
-const FAST_FETCH_CHANGES_PAGE_TIMEOUT_MS = 1_000;
-
-/**
- * Identifies the boundary at which Fast Fetch stopped.
- *
- * - `transport`: the request or response stream was interrupted. Only failures
- *   explicitly created at this boundary may be retried.
- * - `authentication`: CouchDB rejected the supplied credentials.
- * - `protocol`: CouchDB returned an unsuccessful or structurally invalid
- *   response, or an unexpected exception escaped the processing pipeline.
- * - `decryption`: a remote document could not be decrypted or did not produce a
- *   serialisable PouchDB document.
- * - `storage`: a local batch or its durable checkpoint could not be written.
- *
- * This remains a string-literal union because the values are discriminants, not
- * data to enumerate, persist, or map to user-interface labels. The constructor
- * and consumers therefore receive typo checking without a runtime constants
- * object becoming part of the package API.
- */
 export type StreamingFetchFailureStage = "transport" | "authentication" | "protocol" | "decryption" | "storage";
 
-/**
- * A classified Fast Fetch failure. Retryability is explicit rather than inferred
- * from the stage so that future exceptions can be narrowed without broadening all
- * failures at that boundary.
- */
 export class StreamingFetchFailure extends Error {
     override readonly name = "StreamingFetchFailure";
 
@@ -70,8 +38,6 @@ export class StreamingFetchFailure extends Error {
 }
 
 export function isRetryableStreamingFetchFailure(error: unknown): error is StreamingFetchFailure {
-    // Do not accept arbitrary errors which happen to contain `retryable: true`.
-    // Only the streaming boundary is allowed to opt a failure into automatic retry.
     return error instanceof StreamingFetchFailure && error.retryable;
 }
 
@@ -82,8 +48,6 @@ function errorMessage(error: unknown): string {
 
 function asStreamingFetchFailure(error: unknown): StreamingFetchFailure {
     if (error instanceof StreamingFetchFailure) return error;
-    // An unclassified processing exception has no proven recovery behaviour.
-    // Fail closed instead of turning programmer defects into a retry loop.
     return new StreamingFetchFailure(
         "protocol",
         `Fast Fetch encountered an unexpected processing failure: ${errorMessage(error)}`,
@@ -161,9 +125,6 @@ function generatePouchDBBatchWriter(
     decryptFunction: (doc: EntryDoc) => Promise<AnyEntry | EntryLeaf>,
     onCheckpoint?: (sequence: DBSequence) => void | Promise<void>
 ) {
-    // The buffered documents and batchLastSequence form one persistence unit.
-    // A checkpoint may describe this unit only after every document has been
-    // accepted by PouchDB, preserving a contiguous durable prefix of the feed.
     let batchBuffer: AnyDecryptedDoc[] = [];
     let currentBatchSizeBytes = 0;
     let batchLastSequence: DBSequence | undefined;
@@ -188,9 +149,6 @@ function generatePouchDBBatchWriter(
             );
         }
 
-        // With new_edits:false, PouchDB may omit successful results and return an
-        // empty array. Inspect every returned item for an error instead of expecting
-        // one success result per input document.
         const failedResult = results.find(
             (result): result is PouchDB.Core.Error => "error" in result && Boolean(result.error)
         );
@@ -204,12 +162,7 @@ function generatePouchDBBatchWriter(
             );
         }
 
-        if (checkpoint !== undefined) {
-            await saveCheckpoint(onCheckpoint, checkpoint);
-        }
-        // Clear the unit only after both persistence operations succeed. If saving
-        // the checkpoint fails, a later invocation safely replays the already-written
-        // revisions because new_edits:false is idempotent for those revisions.
+        if (checkpoint !== undefined) await saveCheckpoint(onCheckpoint, checkpoint);
         batchBuffer = [];
         currentBatchSizeBytes = 0;
         batchLastSequence = undefined;
@@ -219,12 +172,6 @@ function generatePouchDBBatchWriter(
         async write(doc: EntryDoc, sequence: DBSequence) {
             let decryptedDoc: AnyEntry | EntryLeaf;
             if (doc._deleted) {
-                // A deletion tombstone carries no encrypted payload to decrypt.
-                // Pass it through unchanged so the local database records the
-                // deletion. Some decryption implementations require a path on
-                // obfuscated entries (f: ids) and throw for tombstones, which
-                // would otherwise abort the whole fetch at the first deleted
-                // document in the feed.
                 decryptedDoc = doc as unknown as AnyEntry;
             } else {
                 try {
@@ -252,6 +199,7 @@ function generatePouchDBBatchWriter(
                     { cause: error }
                 );
             }
+
             batchBuffer.push(decryptedDoc);
             currentBatchSizeBytes += serialisedDoc.length;
             batchLastSequence = sequence;
@@ -261,9 +209,6 @@ function generatePouchDBBatchWriter(
             }
         },
         async flushThrough(sequence: DBSequence) {
-            // A changes row may legitimately have no included document. Earlier
-            // buffered rows must still become durable before its sequence can be
-            // recorded, otherwise the checkpoint would jump over unwritten content.
             await flush();
             await saveCheckpoint(onCheckpoint, sequence);
         },
@@ -297,73 +242,40 @@ type DatabaseSyncStatus = {
     results?: unknown[];
 };
 
-type ParsedChangesFeedLine =
-    | { type: "change"; change: CouchChangeLine }
-    | { type: "terminator"; lastSequence: DBSequence };
+type NormalChangesPage = {
+    last_seq?: DBSequence;
+    pending?: number;
+    results?: CouchChangeLine[];
+};
 
-function parseStatusSource(source: string): DatabaseSyncStatus {
+function parseJSONResponse<T extends object>(source: string, operation: string): T {
     const trimmed = source.trim();
     if (!trimmed) {
-        throw new StreamingFetchFailure("protocol", "Fast Fetch received no changes status from CouchDB.", false);
+        throw new StreamingFetchFailure("protocol", `Fast Fetch received an empty response while trying to ${operation}.`, false);
     }
-
-    const candidates = [trimmed, ...trimmed.split("\n").reverse().filter(Boolean)];
-    for (const candidate of candidates) {
-        try {
-            const parsed = JSON.parse(candidate) as unknown;
-            if (parsed && typeof parsed === "object") return parsed as DatabaseSyncStatus;
-        } catch {
-            // Try the final non-blank line when a proxy has returned an NDJSON response.
-        }
-    }
-    throw new StreamingFetchFailure("protocol", "Fast Fetch received an invalid changes status from CouchDB.", false);
-}
-
-function parseChangesFeedLine(line: string): ParsedChangesFeedLine {
-    let parsed: unknown;
     try {
-        parsed = JSON.parse(line);
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (!parsed || typeof parsed !== "object") throw new Error("response is not an object");
+        return parsed as T;
     } catch (error) {
-        throw new StreamingFetchFailure("protocol", "Fast Fetch received a malformed changes-feed row.", false, {
-            cause: error,
-        });
-    }
-    if (!parsed || typeof parsed !== "object") {
-        throw new StreamingFetchFailure("protocol", "Fast Fetch received an invalid changes-feed line.", false);
-    }
-    if (!("seq" in parsed) && "last_seq" in parsed) {
-        const lastSequence = (parsed as DatabaseSyncStatus).last_seq;
-        if (lastSequence === undefined) {
-            throw new StreamingFetchFailure(
-                "protocol",
-                "Fast Fetch received a changes-feed terminator without a sequence.",
-                false
-            );
-        }
-        return { type: "terminator", lastSequence };
-    }
-    if (!("seq" in parsed)) {
         throw new StreamingFetchFailure(
             "protocol",
-            "Fast Fetch received a changes-feed row without a sequence.",
-            false
+            `Fast Fetch received invalid JSON while trying to ${operation}.`,
+            false,
+            { cause: error }
         );
     }
-    const change = parsed as Partial<CouchChangeLine>;
-    if (change.seq === undefined || (change.doc !== undefined && (!change.doc || typeof change.doc !== "object"))) {
-        throw new StreamingFetchFailure("protocol", "Fast Fetch received an invalid changes-feed row.", false);
-    }
-    return { type: "change", change: change as CouchChangeLine };
 }
 
 /**
- * Fetches initial data from CouchDB as a stream and writes it into PouchDB.
- * @param downloadToDB PouchDB instance.
- * @param remoteDbUrl CouchDB database URL (for example: 'https://xxx.com/mydb').
- * @param authHeader Value of the `Authorization` header for CouchDB.
- * @param decryptFunction Function to decrypt each document.
- * @param since Sequence ID to start fetching changes from (default is '0').
- * @param customHeaders Additional request headers required by the CouchDB endpoint or its reverse proxy.
+ * Fetches initial data from CouchDB using finite `feed=normal` pages and writes
+ * it into PouchDB.
+ *
+ * This intentionally avoids consuming CouchDB's `feed=continuous` response via
+ * ReadableStream. Android System WebView can leave `reader.read()` pending even
+ * after the status probe succeeds, which stalls initial sync at 0/N documents.
+ * Finite JSON responses use the same opaque `last_seq` checkpoint semantics but
+ * are handled reliably by both browser fetch and Obsidian's mobile WebView.
  */
 export async function fetchChangesForInitialSync(
     downloadToDB: PouchDB.Database,
@@ -378,39 +290,37 @@ export async function fetchChangesForInitialSync(
     let totalFetched = 0;
     let totalValidFetched = 0;
     let totalBytes = 0;
-    const changesBaseParams = {
-        feed: "continuous",
-        include_docs: "true",
+
+    const fetchHeaders = new Headers(customHeaders);
+    fetchHeaders.set("Accept", "application/json");
+    fetchHeaders.set("Authorization", authHeader);
+
+    const commonParams = {
         style: "all_docs",
         conflicts: "true",
         revs: "true",
-        since: since.toString(),
     } as const;
-    const fetchHeaders = new Headers(customHeaders);
-    fetchHeaders.set("Accept", "application/json");
-    // Credentials belong to the selected CouchDB configuration. Normalising the
-    // names through Headers prevents a differently-cased custom key from
-    // overriding them.
-    fetchHeaders.set("Authorization", authHeader);
 
-    // Capture a progress target from _changes itself. This is deliberately only a
-    // progress hint: a clustered row `seq` and a feed-level `last_seq` can represent
-    // related positions using different opaque values. Completion is established
-    // by per-page probes and finite page terminators below, never by comparing this
-    // target with another token.
-    const targetURL = setParamsToURL(new URL(`${remoteDbUrl}/_changes`), {
-        ...changesBaseParams,
-        feed: "normal",
-        since: "now",
-        limit: "1",
-        include_docs: "false",
-    });
-    const targetResponse = await fetchResponse(
-        targetURL.toString(),
-        { headers: fetchHeaders },
-        "capture the changes target"
-    );
-    const targetStatus = parseStatusSource(await readResponseText(targetResponse, "read the changes target"));
+    const fetchStatus = async (statusSince: DBSequence | "now"): Promise<DatabaseSyncStatus> => {
+        const statusURL = setParamsToURL(new URL(`${remoteDbUrl}/_changes`), {
+            ...commonParams,
+            feed: "normal",
+            since: statusSince.toString(),
+            limit: "1",
+            include_docs: "false",
+        });
+        const response = await fetchResponse(
+            statusURL.toString(),
+            { method: "GET", headers: fetchHeaders },
+            "read changes status"
+        );
+        return parseJSONResponse<DatabaseSyncStatus>(
+            await readResponseText(response, "read changes status"),
+            "read changes status"
+        );
+    };
+
+    const targetStatus = await fetchStatus("now");
     const progressTargetSeq = targetStatus.last_seq;
     if (progressTargetSeq === undefined) {
         throw new StreamingFetchFailure(
@@ -439,29 +349,7 @@ export async function fetchChangesForInitialSync(
     };
 
     const readAvailableChanges = async (pageSince: DBSequence): Promise<number> => {
-        // The normal probe and continuous page intentionally start from the same
-        // opaque cursor and use the same style and filter selection. A GET does not
-        // consume changes on the server; include_docs=false only removes the bodies.
-        //
-        // Use limit=1 rather than limit=0. CouchDB's API documentation describes
-        // zero as equivalent to one, but supported CouchDB releases have also been
-        // observed to return zero rows and keep the full count in `pending`. One
-        // explicit result makes `results.length + pending` portable across both
-        // behaviours and ensures that a final returned row is not mistaken for no
-        // work when `pending` itself is zero.
-        const statusURL = setParamsToURL(new URL(`${remoteDbUrl}/_changes`), {
-            ...changesBaseParams,
-            feed: "normal",
-            since: pageSince.toString(),
-            limit: "1",
-            include_docs: "false",
-        });
-        const response = await fetchResponse(
-            statusURL.toString(),
-            { method: "GET", headers: fetchHeaders },
-            "read changes status"
-        );
-        const status = parseStatusSource(await readResponseText(response, "read changes status"));
+        const status = await fetchStatus(pageSince);
         if (!Array.isArray(status.results)) {
             throw new StreamingFetchFailure(
                 "protocol",
@@ -488,45 +376,54 @@ export async function fetchChangesForInitialSync(
         return available;
     };
 
-    const fetchPage = async (pageSince: DBSequence, pageLimit: number): Promise<DBSequence> => {
-        const controller = new AbortController();
-        let reader: ReadableStreamDefaultReader<string> | undefined;
-        let buffer = "";
-        let fetchedRows = 0;
+    const fetchPageNormal = async (pageSince: DBSequence, pageLimit: number): Promise<DBSequence> => {
+        const changesURL = setParamsToURL(new URL(`${remoteDbUrl}/_changes`), {
+            ...commonParams,
+            feed: "normal",
+            include_docs: "true",
+            since: pageSince.toString(),
+            limit: pageLimit.toString(),
+        });
 
-        const processLine = async (line: string): Promise<DBSequence | undefined> => {
-            const parsed = parseChangesFeedLine(line);
-            if (parsed.type === "terminator") {
-                if (fetchedRows === 0) {
-                    throw new StreamingFetchFailure(
-                        "transport",
-                        "Fast Fetch received no rows after its status probe reported available changes.",
-                        true
-                    );
-                }
-                // The status probe and this stream are separate requests, not a locked
-                // snapshot. A valid page may therefore be shorter than the estimate.
-                // Make its documents durable, persist its opaque terminator verbatim,
-                // and let the next normal probe establish whether more work remains.
-                await batchWriter.flush();
-                await saveCheckpoint(onCheckpoint, parsed.lastSequence);
-                reportProgress(true);
-                return parsed.lastSequence;
+        const response = await fetchResponse(
+            changesURL.toString(),
+            { method: "GET", headers: fetchHeaders },
+            "fetch a bounded normal changes page"
+        );
+        const raw = await readResponseText(response, "read a bounded normal changes page");
+        totalBytes += new TextEncoder().encode(raw).byteLength;
+        const page = parseJSONResponse<NormalChangesPage>(raw, "parse a bounded normal changes page");
+
+        if (!Array.isArray(page.results)) {
+            throw new StreamingFetchFailure(
+                "protocol",
+                "Fast Fetch normal changes page did not contain a valid results array.",
+                false
+            );
+        }
+        if (page.last_seq === undefined) {
+            throw new StreamingFetchFailure(
+                "protocol",
+                "Fast Fetch normal changes page did not contain last_seq.",
+                false
+            );
+        }
+        if (page.results.length === 0) {
+            throw new StreamingFetchFailure(
+                "transport",
+                "Fast Fetch received no rows after its status probe reported available changes.",
+                true
+            );
+        }
+
+        for (const change of page.results) {
+            if (!change || typeof change !== "object" || change.seq === undefined) {
+                throw new StreamingFetchFailure("protocol", "Fast Fetch received an invalid changes row.", false);
+            }
+            if (change.doc !== undefined && (!change.doc || typeof change.doc !== "object")) {
+                throw new StreamingFetchFailure("protocol", "Fast Fetch received an invalid included document.", false);
             }
 
-            if (fetchedRows >= pageLimit) {
-                throw new StreamingFetchFailure(
-                    "protocol",
-                    `Fast Fetch received more than its ${pageLimit}-row page limit.`,
-                    false
-                );
-            }
-            const change = parsed.change;
-            // CouchDB's limit counts outer result rows. Tombstones and rows without
-            // an included document each consume one slot; multiple leaf revisions in
-            // the inner `changes` array do not. Count the row before deciding whether
-            // it requires a local document write.
-            fetchedRows++;
             totalFetched++;
             if (change.doc) {
                 await batchWriter.write(change.doc, change.seq);
@@ -535,99 +432,20 @@ export async function fetchChangesForInitialSync(
                 await batchWriter.flushThrough(change.seq);
             }
             reportProgress();
-            return undefined;
-        };
-
-        try {
-            const changesURL = setParamsToURL(new URL(`${remoteDbUrl}/_changes`), {
-                ...changesBaseParams,
-                since: pageSince.toString(),
-                limit: pageLimit.toString(),
-                timeout: FAST_FETCH_CHANGES_PAGE_TIMEOUT_MS.toString(),
-            });
-            const response = await fetchResponse(
-                changesURL.toString(),
-                {
-                    method: "GET",
-                    headers: fetchHeaders,
-                    signal: controller.signal,
-                },
-                "open the changes feed"
-            );
-            if (!response.body) {
-                throw new StreamingFetchFailure(
-                    "protocol",
-                    "Fast Fetch could not read the CouchDB response stream.",
-                    false
-                );
-            }
-
-            const decoder = new TextDecoder();
-            const byteCountingDecoderStream = new TransformStream<Uint8Array, string>({
-                transform(chunk, streamController) {
-                    totalBytes += chunk.byteLength;
-                    const decoded = decoder.decode(chunk, { stream: true });
-                    if (decoded) streamController.enqueue(decoded);
-                },
-                flush(streamController) {
-                    const decoded = decoder.decode();
-                    if (decoded) streamController.enqueue(decoded);
-                },
-            });
-            reader = response.body.pipeThrough(byteCountingDecoderStream).getReader();
-
-            while (true) {
-                reportProgress();
-                let readResult: ReadableStreamReadResult<string>;
-                try {
-                    readResult = await reader.read();
-                } catch (error) {
-                    throw transportFailure("read the changes feed", error);
-                }
-
-                if (readResult.done) {
-                    if (buffer.trim()) {
-                        const lastSequence = await processLine(buffer);
-                        if (lastSequence !== undefined) return lastSequence;
-                    }
-                    await batchWriter.flush();
-                    throw new StreamingFetchFailure(
-                        "transport",
-                        "The bounded CouchDB changes feed ended without a last_seq terminator.",
-                        true
-                    );
-                }
-
-                buffer += readResult.value;
-                const lines = buffer.split("\n");
-                buffer = lines.pop() || "";
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    const lastSequence = await processLine(line);
-                    if (lastSequence !== undefined) return lastSequence;
-                }
-            }
-        } finally {
-            controller.abort();
-            if (reader) {
-                try {
-                    await reader.cancel();
-                } catch {
-                    // The stream may already be closed or errored at this point.
-                }
-                reader.releaseLock();
-            }
         }
+
+        await batchWriter.flush();
+        await saveCheckpoint(onCheckpoint, page.last_seq);
+        reportProgress(true);
+        return page.last_seq;
     };
 
     try {
         let pageSince: DBSequence = since;
         let started = false;
+
         while (true) {
             const available = await readAvailableChanges(pageSince);
-            // A later probe may observe writes which arrived after the initial
-            // progress target. Keep the denominator useful without treating it as a
-            // completion contract.
             docsToFetch = Math.max(docsToFetch, totalFetched + available);
             if (available === 0) break;
 
@@ -637,14 +455,13 @@ export async function fetchChangesForInitialSync(
                     `Starting initial synchronisation. Current sequence: ${since}, Target sequence: ${progressTargetSeq}, Documents to fetch: ${docsToFetch}.`
                 );
             }
+
             const pageLimit = Math.min(FAST_FETCH_CHANGES_PAGE_LIMIT, available);
-            const pageTerminator = await fetchPage(pageSince, pageLimit);
-            // Treat last_seq as an opaque cursor: store and replay the exact value.
-            // Do not compare it with a row token, target token, or later probe token.
-            pageSince = pageTerminator;
+            pageSince = await fetchPageNormal(pageSince, pageLimit);
         }
+
         if (started) {
-            Logger("Fast Fetch is caught up and durable in the local database.");
+            Logger("Fast Fetch is caught up and durable in the local database (normal-feed fallback).");
             reportProgress(true);
         } else {
             Logger("No changes remain for Fast Fetch.");
@@ -652,10 +469,6 @@ export async function fetchChangesForInitialSync(
     } catch (error) {
         const failure = asStreamingFetchFailure(error);
         if (failure.stage !== "storage") {
-            // Preserve useful work before a later protocol, transport, or decryption
-            // failure. A storage failure is not flushed again here because the failed
-            // batch may already be partly applied; the retained older checkpoint makes
-            // replay explicit and idempotent on the next invocation.
             try {
                 await batchWriter.flush();
             } catch (flushError) {
